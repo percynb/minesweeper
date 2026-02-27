@@ -1,22 +1,20 @@
-/*
-  Arduino 8x8 Minesweeper (Serial + LED)
-
-  - Board size: 8x8
-  - Play from Serial Monitor by typing commands:
-      r <row> <col>   -> reveal cell (example: r 2 5)
-      f <row> <col>   -> toggle flag (example: f 6 1)
-      n               -> start a new game
-
-  Row and column range: 0..7
-
-  LED behavior (LED_BUILTIN):
-    - OFF while game is running
-    - ON  when player wins
-    - FAST BLINK when player hits a mine (game over)
-*/
+#include <Arduino.h>
+#include <LedControl.h>
 
 const byte SIZE = 8;
 const byte MINES = 10;
+
+// ---------- Pin mapping ----------
+const byte PIN_DIN = 12;   // MAX7219 DIN
+const byte PIN_CLK = 11;   // MAX7219 CLK
+const byte PIN_CS  = 10;   // MAX7219 CS
+
+const byte PIN_JOY_X = A0;
+const byte PIN_JOY_Y = A1;
+const byte PIN_JOY_SW = 2;      // Active LOW with INPUT_PULLUP
+const byte PIN_PWR_BTN = 3;     // Active LOW with INPUT_PULLUP
+
+LedControl matrix(PIN_DIN, PIN_CLK, PIN_CS, 1);
 
 struct Cell {
   bool mine;
@@ -26,12 +24,30 @@ struct Cell {
 };
 
 Cell board[SIZE][SIZE];
+
+bool poweredOn = true;
 bool gameOver = false;
 bool gameWon = false;
-unsigned long lastBlinkMs = 0;
-bool blinkState = false;
 
-// ---------- Utility ----------
+byte cursorRow = 0;
+byte cursorCol = 0;
+
+unsigned long lastAnimMs = 0;
+bool animPhase = false;
+
+unsigned long lastMoveMs = 0;
+const unsigned long MOVE_INTERVAL_MS = 180;
+const int JOY_LOW = 350;
+const int JOY_HIGH = 700;
+
+bool lastJoySwState = HIGH;
+unsigned long joyPressStartMs = 0;
+const unsigned long LONG_PRESS_MS = 500;
+
+bool lastPwrBtnState = HIGH;
+unsigned long lastPwrDebounceMs = 0;
+const unsigned long BTN_DEBOUNCE_MS = 40;
+
 bool inBounds(int r, int c) {
   return r >= 0 && r < SIZE && c >= 0 && c < SIZE;
 }
@@ -54,9 +70,7 @@ byte countAdjacentMines(byte row, byte col) {
       if (dr == 0 && dc == 0) continue;
       int nr = row + dr;
       int nc = col + dc;
-      if (inBounds(nr, nc) && board[nr][nc].mine) {
-        count++;
-      }
+      if (inBounds(nr, nc) && board[nr][nc].mine) count++;
     }
   }
   return count;
@@ -80,35 +94,6 @@ void placeMines() {
   }
 }
 
-void printBoard(bool revealAll) {
-  Serial.println();
-  Serial.println(F("   0 1 2 3 4 5 6 7"));
-  for (byte r = 0; r < SIZE; r++) {
-    Serial.print(r);
-    Serial.print(F("  "));
-    for (byte c = 0; c < SIZE; c++) {
-      char out;
-      Cell &cell = board[r][c];
-
-      if (revealAll && cell.mine) {
-        out = '*';
-      } else if (cell.revealed) {
-        if (cell.mine) out = '*';
-        else if (cell.adjacent == 0) out = '.';
-        else out = '0' + cell.adjacent;
-      } else if (cell.flagged) {
-        out = 'F';
-      } else {
-        out = '#';
-      }
-
-      Serial.print(out);
-      Serial.print(' ');
-    }
-    Serial.println();
-  }
-}
-
 void floodReveal(byte row, byte col) {
   if (!inBounds(row, col)) return;
 
@@ -121,11 +106,7 @@ void floodReveal(byte row, byte col) {
   for (int dr = -1; dr <= 1; dr++) {
     for (int dc = -1; dc <= 1; dc++) {
       if (dr == 0 && dc == 0) continue;
-      int nr = row + dr;
-      int nc = col + dc;
-      if (inBounds(nr, nc)) {
-        floodReveal(nr, nc);
-      }
+      floodReveal(row + dr, col + dc);
     }
   }
 }
@@ -133,9 +114,7 @@ void floodReveal(byte row, byte col) {
 bool checkWin() {
   for (byte r = 0; r < SIZE; r++) {
     for (byte c = 0; c < SIZE; c++) {
-      if (!board[r][c].mine && !board[r][c].revealed) {
-        return false;
-      }
+      if (!board[r][c].mine && !board[r][c].revealed) return false;
     }
   }
   return true;
@@ -146,35 +125,22 @@ void startNewGame() {
   placeMines();
   gameOver = false;
   gameWon = false;
-  digitalWrite(LED_BUILTIN, LOW);
+  cursorRow = 0;
+  cursorCol = 0;
 
-  Serial.println(F("\n=== New 8x8 Minesweeper Game ==="));
-  Serial.println(F("Commands: r row col | f row col | n"));
-  printBoard(false);
+  Serial.println(F("New game started."));
 }
 
 void revealCell(byte row, byte col) {
-  if (!inBounds(row, col)) {
-    Serial.println(F("Invalid coordinate (use 0..7)."));
-    return;
-  }
+  if (!inBounds(row, col) || gameOver) return;
 
   Cell &cell = board[row][col];
-  if (cell.revealed) {
-    Serial.println(F("Cell already revealed."));
-    return;
-  }
-  if (cell.flagged) {
-    Serial.println(F("Cell is flagged. Unflag first."));
-    return;
-  }
+  if (cell.revealed || cell.flagged) return;
 
   if (cell.mine) {
     gameOver = true;
     gameWon = false;
-    Serial.println(F("BOOM! You hit a mine."));
-    printBoard(true);
-    Serial.println(F("Type 'n' to start a new game."));
+    Serial.println(F("BOOM! Mine hit."));
     return;
   }
 
@@ -183,103 +149,176 @@ void revealCell(byte row, byte col) {
   if (checkWin()) {
     gameOver = true;
     gameWon = true;
-    digitalWrite(LED_BUILTIN, HIGH);
-    Serial.println(F("Congratulations! You cleared the board."));
-    printBoard(true);
-    Serial.println(F("Type 'n' to start a new game."));
-    return;
+    Serial.println(F("You win!"));
   }
-
-  printBoard(false);
 }
 
 void toggleFlag(byte row, byte col) {
-  if (!inBounds(row, col)) {
-    Serial.println(F("Invalid coordinate (use 0..7)."));
-    return;
-  }
+  if (!inBounds(row, col) || gameOver) return;
 
   Cell &cell = board[row][col];
-  if (cell.revealed) {
-    Serial.println(F("Cannot flag a revealed cell."));
-    return;
-  }
-
+  if (cell.revealed) return;
   cell.flagged = !cell.flagged;
-  printBoard(false);
 }
 
-void parseCommand() {
-  if (!Serial.available()) return;
-
-  char cmd = tolower(Serial.read());
-
-  if (cmd == '\n' || cmd == '\r' || cmd == ' ') {
-    return;
-  }
-
-  if (cmd == 'n') {
-    while (Serial.available()) Serial.read();
-    startNewGame();
-    return;
-  }
-
-  int row = Serial.parseInt();
-  int col = Serial.parseInt();
-  while (Serial.available()) Serial.read();
-
-  if (row < 0 || row >= SIZE || col < 0 || col >= SIZE) {
-    Serial.println(F("Use format: r 0..7 0..7 or f 0..7 0..7"));
-    return;
-  }
-
-  if (gameOver) {
-    Serial.println(F("Game is over. Type 'n' for a new game."));
-    return;
-  }
-
-  if (cmd == 'r') {
-    revealCell((byte)row, (byte)col);
-  } else if (cmd == 'f') {
-    toggleFlag((byte)row, (byte)col);
-  } else {
-    Serial.println(F("Unknown command. Use r, f, or n."));
-  }
+void setMatrixPixel(byte r, byte c, bool on) {
+  matrix.setLed(0, r, c, on);
 }
 
-void updateLedState() {
-  if (!gameOver) {
-    digitalWrite(LED_BUILTIN, LOW);
+void clearMatrix() {
+  matrix.clearDisplay(0);
+}
+
+void renderBoard() {
+  if (!poweredOn) {
+    clearMatrix();
     return;
   }
 
-  if (gameWon) {
-    digitalWrite(LED_BUILTIN, HIGH);
-  } else {
-    // Lost game => blink LED quickly.
-    unsigned long now = millis();
-    if (now - lastBlinkMs >= 200) {
-      lastBlinkMs = now;
-      blinkState = !blinkState;
-      digitalWrite(LED_BUILTIN, blinkState ? HIGH : LOW);
+  unsigned long now = millis();
+  if (now - lastAnimMs >= 250) {
+    lastAnimMs = now;
+    animPhase = !animPhase;
+  }
+
+  for (byte r = 0; r < SIZE; r++) {
+    for (byte c = 0; c < SIZE; c++) {
+      bool on = false;
+      Cell &cell = board[r][c];
+
+      if (gameOver && !gameWon && cell.mine) {
+        on = animPhase;  // blink all mines on loss
+      } else if (cell.revealed) {
+        on = true;
+      } else if (cell.flagged) {
+        on = animPhase;  // blink flag
+      }
+
+      if (!gameOver && r == cursorRow && c == cursorCol) {
+        on = !on && animPhase;  // blinking cursor overlay
+      }
+
+      setMatrixPixel(r, c, on);
     }
   }
 }
 
-void setup() {
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
+void handlePowerButton() {
+  bool current = digitalRead(PIN_PWR_BTN);
+  unsigned long now = millis();
 
-  Serial.begin(9600);
-  while (!Serial) {
-    ;  // Needed on some boards (like Leonardo)
+  if (current != lastPwrBtnState) {
+    lastPwrDebounceMs = now;
+    lastPwrBtnState = current;
   }
 
-  randomSeed(analogRead(A0));
+  if ((now - lastPwrDebounceMs) < BTN_DEBOUNCE_MS) return;
+
+  static bool pressedHandled = false;
+  if (current == LOW && !pressedHandled) {
+    pressedHandled = true;
+    poweredOn = !poweredOn;
+
+    if (poweredOn) {
+      Serial.println(F("Power ON"));
+      startNewGame();
+    } else {
+      Serial.println(F("Power OFF"));
+      clearMatrix();
+    }
+  }
+
+  if (current == HIGH) {
+    pressedHandled = false;
+  }
+}
+
+void moveCursor(int dRow, int dCol) {
+  int nr = (int)cursorRow + dRow;
+  int nc = (int)cursorCol + dCol;
+
+  if (nr < 0) nr = 0;
+  if (nr >= SIZE) nr = SIZE - 1;
+  if (nc < 0) nc = 0;
+  if (nc >= SIZE) nc = SIZE - 1;
+
+  cursorRow = (byte)nr;
+  cursorCol = (byte)nc;
+}
+
+void handleJoystickMove() {
+  if (!poweredOn || gameOver) return;
+
+  unsigned long now = millis();
+  if (now - lastMoveMs < MOVE_INTERVAL_MS) return;
+
+  int x = analogRead(PIN_JOY_X);
+  int y = analogRead(PIN_JOY_Y);
+
+  int dRow = 0;
+  int dCol = 0;
+
+  if (x < JOY_LOW) dCol = -1;
+  else if (x > JOY_HIGH) dCol = 1;
+
+  if (y < JOY_LOW) dRow = 1;
+  else if (y > JOY_HIGH) dRow = -1;
+
+  if (dRow != 0 || dCol != 0) {
+    moveCursor(dRow, dCol);
+    lastMoveMs = now;
+  }
+}
+
+void handleJoystickPress() {
+  if (!poweredOn) return;
+
+  bool current = digitalRead(PIN_JOY_SW);
+  unsigned long now = millis();
+
+  // Press start
+  if (lastJoySwState == HIGH && current == LOW) {
+    joyPressStartMs = now;
+  }
+
+  // Release => short/long press action
+  if (lastJoySwState == LOW && current == HIGH) {
+    unsigned long pressMs = now - joyPressStartMs;
+    if (!gameOver) {
+      if (pressMs >= LONG_PRESS_MS) {
+        toggleFlag(cursorRow, cursorCol);
+      } else {
+        revealCell(cursorRow, cursorCol);
+      }
+    } else if (gameWon) {
+      startNewGame();
+    }
+  }
+
+  lastJoySwState = current;
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(PIN_JOY_SW, INPUT_PULLUP);
+  pinMode(PIN_PWR_BTN, INPUT_PULLUP);
+
+  matrix.shutdown(0, false);
+  matrix.setIntensity(0, 6);
+  clearMatrix();
+
+  randomSeed(analogRead(A2));
   startNewGame();
+
+  Serial.println(F("Minesweeper ready."));
+  Serial.println(F("Short press joystick = reveal, long press = flag."));
+  Serial.println(F("Power button toggles game on/off."));
 }
 
 void loop() {
-  parseCommand();
-  updateLedState();
+  handlePowerButton();
+  handleJoystickMove();
+  handleJoystickPress();
+  renderBoard();
 }
